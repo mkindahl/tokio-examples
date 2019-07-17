@@ -1,43 +1,46 @@
-use core::marker;
 use futures::stream::Stream;
 use futures::{Async, Poll};
 use std::iter::Cycle;
-//use std::time::{Duration, Instant};
-//use tokio::timer::Interval;
+use std::time::{Duration, Instant};
+use tokio::timer::Interval;
 
-pub struct IterCycle<I, E> {
+struct IterCycle<I> {
     iter: Cycle<I>,
-    _marker: marker::PhantomData<fn() -> E>,
 }
 
-pub fn iter_cycle<I, E>(i: I) -> IterCycle<I::IntoIter, E>
+fn iter_cycle<I>(i: I) -> IterCycle<I::IntoIter>
 where
     I: IntoIterator,
     I::IntoIter: Clone,
 {
     IterCycle {
         iter: i.into_iter().cycle(),
-        _marker: marker::PhantomData,
     }
 }
 
-impl<I, E> Stream for IterCycle<I, E>
+impl<I> Stream for IterCycle<I>
 where
     I: Iterator + Clone,
 {
     type Item = <I as Iterator>::Item;
-    type Error = E;
+    type Error = ();
 
-    fn poll(&mut self) -> Poll<Option<I::Item>, E> {
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         Ok(Async::Ready(self.iter.next()))
     }
 }
 
 fn main() {
+    // iter_cycle return a stream with Error = (), which means that we
+    // need to map the error from the Interval stream to () as well.
     let primes = iter_cycle(vec![2, 3, 5, 7, 11, 13])
         .take(20)
-        .for_each(|number| {
-            println!("fire; number={}", number);
+        .zip(
+            Interval::new(Instant::now(), Duration::from_millis(500))
+                .map_err(|err| println!("Error: {}", err)),
+        )
+        .for_each(|(number, instant)| {
+            println!("fire; number={}, instant={:?}", number, instant);
             Ok(())
         });
     tokio::run(primes);
