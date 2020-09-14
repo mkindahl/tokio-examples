@@ -16,10 +16,13 @@
 // with an Interval stream.
 
 use futures::stream::Stream;
-use futures::{Async, Poll};
+use futures::StreamExt;
 use std::iter::Cycle;
-use std::time::{Duration, Instant};
-use tokio::timer::Interval;
+use std::marker::Unpin;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::time::interval;
 
 struct IterCycle<I> {
     iter: Cycle<I>,
@@ -37,28 +40,24 @@ where
 
 impl<I> Stream for IterCycle<I>
 where
-    I: Iterator + Clone,
+    I: Iterator + Clone + Unpin,
 {
     type Item = <I as Iterator>::Item;
-    type Error = ();
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        Ok(Async::Ready(self.iter.next()))
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.iter.next())
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // iter_cycle return a stream with Error = (), which means that we
     // need to map the error from the Interval stream to () as well.
-    let primes = iter_cycle(vec![2, 3, 5, 7, 11, 13])
+    let mut primes = iter_cycle(vec![2, 3, 5, 7, 11, 13])
         .take(20)
-        .zip(
-            Interval::new(Instant::now(), Duration::from_millis(500))
-                .map_err(|err| println!("Error: {}", err)),
-        )
-        .for_each(|(number, instant)| {
-            println!("fire; number={}, instant={:?}", number, instant);
-            Ok(())
-        });
-    tokio::run(primes);
+        .zip(interval(Duration::from_millis(500)));
+
+    while let Some((number, instant)) = primes.next().await {
+        println!("fire; number={}, instant={:?}", number, instant);
+    }
 }

@@ -23,19 +23,21 @@
 // thread that send another message on the UDP socket using the
 // channel.
 
-use bytes::Bytes;
 use futures::prelude::*;
-use futures::sink::Sink;
-use futures::stream::Stream;
-use futures::sync::mpsc;
 use std::env;
 use std::net::SocketAddr;
 use std::result::Result;
 use std::str::from_utf8;
-use std::time::{Duration, Instant};
-use tokio::codec::BytesCodec;
-use tokio::net::{UdpFramed, UdpSocket};
-use tokio::timer::Interval;
+use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::time::interval;
+use tokio::{io, join};
+
+struct Message {
+    buf: String,
+    dest: Option<SocketAddr>,
+}
 
 #[derive(Debug)]
 enum Error {
@@ -56,92 +58,102 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl<M, A> From<futures::sync::mpsc::TrySendError<(M, A)>> for Error {
-    fn from(error: futures::sync::mpsc::TrySendError<(M, A)>) -> Error {
+impl<M, A> From<mpsc::error::TrySendError<(M, A)>> for Error {
+    fn from(error: mpsc::error::TrySendError<(M, A)>) -> Error {
         Error::GenericError(format!("{}", error))
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = env::args().nth(1).unwrap_or("127.0.0.1:8080".to_string());
     let socket = {
         let addr = address.parse::<SocketAddr>()?;
-        UdpSocket::bind(&addr)?
+        UdpSocket::bind(&addr).await?
     };
 
     // Here we split the socket into the sender and receiver side. We
     // cannot clone the sender (writer) side, so we have to handle
     // this using an mpsc channel.
-    let (mut writer, reader) = UdpFramed::new(socket, BytesCodec::new()).split();
+    let (mut reader, mut writer) = socket.split();
 
     // Create an mpsc channel to use for internal communication. We
     // can clone the writer side of the channel (tx), so we are going
     // to use that later.
-    let (tx, rx) = mpsc::channel(1024);
+    let (mut tx, mut rx): (mpsc::Sender<Message>, mpsc::Receiver<Message>) = mpsc::channel(10);
 
     // This is the transmitting task that will transmit anything that
     // arrives on the channel. The socket address is optional, and if
     // none is provided, the last used address will be used.
     let transmitter_task = {
         let mut last_address: Option<SocketAddr> = None;
-        rx.for_each(move |(msg, dest): (String, Option<SocketAddr>)| {
-            let address = match dest {
-                Some(addr) => Some(addr),
-                None => last_address,
-            };
-            last_address = address;
-            if let Some(addr) = address {
-                // start_send() + poll_complete() is used here since
-                // send() is FnOnce, while start_send() and
-                // poll_complete() are FnMut.
-                writer
-                    .start_send((Bytes::from(msg), addr))
-                    .map_err(|_| ())?;
-                writer.poll_complete().map_err(|_| ())?;
+        async move {
+            while let Some(msg) = rx.recv().await {
+                let address = match msg.dest {
+                    Some(addr) => Some(addr),
+                    None => last_address,
+                };
+                last_address = address;
+                if let Some(dest) = address {
+                    let packet = format!("FYI - {}\n", msg.buf);
+                    writer.send_to(packet.as_bytes(), &dest).await?;
+                }
             }
-            Ok(())
-        })
-        .map_err(|err| println!("error: {:?}", err))
+            Ok::<_, io::Error>(())
+        }
     };
 
     // This is the receiver task that handles all incoming
-    // packets.
+    // packets. They are just relayed to the transmitter task.
     let receiver_task = {
         let mut tx = tx.clone();
-        reader
-            .map_err(|e| Error::IOError(e))
-            .for_each(move |(msg, addr)| {
-                let msg = format!("Simon says: {}", from_utf8(&msg)?);
-                tx.try_send((msg, Some(addr)))?;
-                Ok(())
-            })
-            .map_err(|err| println!("error: {:?}", err))
-            .map(|_| ())
+        async move {
+            let mut buf = vec![0; 128];
+            loop {
+                let (count, addr) = reader.recv_from(&mut buf).await?;
+                if count == 0 {
+                    break;
+                }
+                let msg = Message {
+                    buf: format!("Simon says: '{}'", from_utf8(&buf).unwrap()),
+                    dest: Some(addr),
+                };
+                if let Err(err) = tx.send(msg).await {
+                    println!("Error: {}", err);
+                    break;
+                }
+            }
+            Ok::<_, io::Error>(())
+        }
     };
 
     // This is a regular task that just inject a message into the
-    // queue. We use it to demonstrate how to send messages on the
-    // same socket from multiple closures.
+    // queue of the transmitter task. We use it to demonstrate how to
+    // send messages on the same socket from multiple closures.
     let injector_task = {
-        let mut tx = tx.clone();
-        let mut seconds = 1;
-        Interval::new(Instant::now(), Duration::from_millis(1000))
-            // This is needed to use our version of Error rather than
-            // IntervalError.
-            .map_err(|err| Error::GenericError(format!("interval error: {}", err)))
-            .for_each(move |_| {
+        async move {
+            let mut seconds: i32 = 1;
+            let mut ticks = interval(Duration::from_millis(1000));
+            while let Some(_interval) = ticks.next().await {
                 seconds += 1;
-                tx.try_send((format!("{} seconds passed\n", seconds), None))?;
-                Ok(())
-            })
-            .map_err(|e| panic!("first - interval errored; err={:?}", e))
+                let msg = Message {
+                    buf: format!("{} seconds passed", seconds),
+                    dest: None,
+                };
+                if let Err(err) = tx.send(msg).await {
+                    println!("Error: {}", err);
+                    break;
+                }
+            }
+            Ok::<_, io::Error>(())
+        }
     };
 
-    tokio::run(futures::lazy(|| {
-        tokio::spawn(transmitter_task);
-        tokio::spawn(receiver_task);
-        tokio::spawn(injector_task);
-        Ok(())
-    }));
+    let _ = join!(
+        tokio::spawn(transmitter_task),
+        tokio::spawn(receiver_task),
+        tokio::spawn(injector_task),
+    );
+
     Ok(())
 }

@@ -12,18 +12,6 @@
 // implied.  See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! Example application that receives messages over UDP.
-//!
-//! This application will receive messages over UDP and print them to
-//! the terminal. It will listen on port 6148 and spawn a session for
-//! any incoming UDP connection, read the messages until the
-//! connection is shut down.
-//!
-//! You can start it using:
-//! ```bash
-//! cargo run --example receiver-udp
-//! ```
-
 use std::error::Error;
 use std::str::from_utf8;
 use tokio;

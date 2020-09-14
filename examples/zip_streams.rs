@@ -23,37 +23,27 @@
 
 extern crate futures;
 
-use futures::{stream, Stream};
-use std::time::{Duration, Instant};
-use tokio::prelude::*;
-use tokio::timer;
+use futures::{stream, Stream, StreamExt};
+use std::time::Duration;
+use tokio::time;
 
 // Produce a stream of Fibonacci numbers.
 //
 // Note that the error for the stream is the same as what the
 // interval timer for Tokio produces.
-fn fibonacci() -> impl Stream<Item = u64, Error = ()> {
-    stream::unfold((1, 1), |(curr, next)| {
-        let new_next = curr + next;
-        Some(Ok((curr, (next, new_next))))
+fn fibonacci() -> impl Stream<Item = u64> {
+    stream::unfold((1, 1), |(curr, next)| async move {
+        Some((curr, (next, curr + next)))
     })
 }
 
-#[derive(Debug)]
-enum Error {
-    Unused,
-    Timer(timer::Error),
-}
+#[tokio::main]
+pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pairs = time::interval(Duration::from_millis(500)).zip(fibonacci());
+    tokio::pin!(pairs);
+    while let Some((instant, number)) = pairs.next().await {
+        println!("fire; instant={:?}, number={}", instant, number);
+    }
 
-fn main() {
-    let task = timer::Interval::new(Instant::now(), Duration::from_millis(500))
-        .map_err(|err| Error::Timer(err))
-        .zip(fibonacci().map_err(|()| Error::Unused))
-        .for_each(|(instant, number)| {
-            println!("fire; instant={:?}, number={}", instant, number);
-            Ok(())
-        })
-        .map_err(|e| panic!("interval errored; err={:?}", e));
-
-    tokio::run(task);
+    Ok(())
 }

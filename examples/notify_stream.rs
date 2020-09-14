@@ -14,7 +14,7 @@
 
 // Example to demonstrate how to create a stream that can be halted
 // and resumed. The key problem here is that you want to return
-// `Async::NotReady` and still have a guarantee that an attempt to
+// `Async::NotReady` and stillhave a guarantee that an attempt to
 // call it will be done later.
 //
 // This was based on the problem of creating an infinite stream over a
@@ -22,11 +22,12 @@
 // produce anything until the list is actually non-empty.
 
 use futures::stream::Stream;
-use futures::task::{self, Task};
-use futures::{Async, Poll};
+use futures::{future, StreamExt};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tokio::timer::Interval;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::time::interval;
 
 // Cyclic stream.
 //
@@ -36,41 +37,36 @@ use tokio::timer::Interval;
 #[derive(Debug)]
 struct MyStream {
     state: Arc<Mutex<State>>,
-    index: usize,
 }
 
 impl MyStream {
     fn new(state: Arc<Mutex<State>>) -> MyStream {
-        MyStream {
-            state: state,
-            index: 0,
-        }
+        MyStream { state: state }
     }
 }
 
 impl Stream for MyStream {
-    type Item = i32;
-    type Error = ();
+    type Item = Result<i32, ()>;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut locked_state = self.state.lock().unwrap();
         if locked_state.array.len() > 0 {
             // If the array contains something, just return the next
             // items in the vector in a cyclic fashion.
-            if self.index >= locked_state.array.len() {
-                self.index = 0;
+            if locked_state.index >= locked_state.array.len() {
+                locked_state.index = 0;
             }
-            let result = locked_state.array[self.index];
-            self.index += 1;
-            Ok(Async::Ready(Some(result)))
+            let result = locked_state.array[locked_state.index];
+            locked_state.index += 1;
+            Poll::Ready(Some(Ok(result)))
         } else {
             // If the array is empty, just ask to be notified in the
             // future and say that the stream is not ready.
             //
             // If we do not ask to be notified in the future
             // explicitly, this future will never be scheduled again.
-            locked_state.task = Some(task::current());
-            Ok(Async::NotReady)
+            cx.waker().wake_by_ref();
+            Poll::Pending
         }
     }
 }
@@ -78,62 +74,56 @@ impl Stream for MyStream {
 #[derive(Debug)]
 struct State {
     array: Vec<i32>,
-    task: Option<Task>,
+    index: usize,
 }
 
 impl State {
     fn new() -> Self {
         Self {
             array: Vec::new(),
-            task: None,
+            index: 0,
         }
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let shared_state = Arc::new(Mutex::new(State::new()));
 
     // This future just produces one number each second from the
     // stream.
-    let numbers = MyStream::new(shared_state.clone())
-        .zip(
-            Interval::new(Instant::now(), Duration::from_millis(1000))
-                .map_err(|err| println!("Error: {}", err)),
-        )
-        .for_each(|(number, _instant)| {
-            println!("got number {}", number);
-            Ok(())
-        });
+    let numbers_fut = {
+        let mut numbers =
+            MyStream::new(shared_state.clone()).zip(interval(Duration::from_millis(1000)));
+        async move {
+            while let Some((number, _instant)) = numbers.next().await {
+                println!("got number {:?}", number);
+            }
+        }
+    };
 
     // This future run every 5 seconds and insert an item into the
     // array, up to a limit of 5, and then clears the array again.
-    let on_off = {
+    let on_off_fut = {
         let state = shared_state.clone();
         // This variable will retain the state between invocations of
         // the closure below.
         let mut val = 0;
-        Interval::new(Instant::now(), Duration::from_millis(5000))
-            .map_err(|err| println!("Error: {}", err))
-            .for_each(move |_instant| {
+        async move {
+            let mut ticks = interval(Duration::from_millis(5000));
+            while let Some(_instant) = ticks.next().await {
                 let mut locked_state = state.lock().unwrap();
                 if locked_state.array.len() < 5 {
                     println!("pushing {} on array", val);
                     locked_state.array.push(val);
                     val += 1;
-                    if let Some(task) = locked_state.task.take() {
-                        task.notify();
-                    }
                 } else {
                     println!("clearing array");
                     locked_state.array.clear();
                 }
-                Ok(())
-            })
+            }
+        }
     };
 
-    tokio::run(futures::lazy(|| {
-        tokio::spawn(numbers);
-        tokio::spawn(on_off);
-        Ok(())
-    }));
+    let _ = future::join(tokio::spawn(numbers_fut), tokio::spawn(on_off_fut)).await;
 }

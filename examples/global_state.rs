@@ -18,11 +18,15 @@
 // Key here is that the shared state should be available for all
 // spawned threads with a lifetime that spans them, but not have to
 // have a static lifetime.
+//
+// For the example, we create two independent interval streams that
+// will increase and decrease the version of the shared state at
+// different paces.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tokio::prelude::*;
-use tokio::timer::Interval;
+use std::time::Duration;
+use tokio::stream::StreamExt;
+use tokio::time::interval;
 
 #[derive(Debug)]
 struct State {
@@ -43,40 +47,39 @@ impl State {
     }
 }
 
-fn main() {
-    // We create a lazy future that create the state to be shared and
-    // pass that to `tokio::run`.
-    //
-    // We then crate two independent interval streams that will
-    // increase and decrease the version of the shared state at
-    // different paces.
-    tokio::run(futures::lazy(|| {
-        let shared_state = Arc::new(Mutex::new(State::new()));
+#[tokio::main]
+async fn main() {
+    let shared_state = Arc::new(Mutex::new(State::new()));
 
-        tokio::spawn({
-            let state = shared_state.clone();
-            Interval::new(Instant::now(), Duration::from_millis(5000))
-                .for_each(move |instant| {
-                    let mut locked_state = state.lock().unwrap();
-                    locked_state.dec();
-                    println!("first - instant={:?}, state={:?}", instant, locked_state);
-                    Ok(())
-                })
-                .map_err(|e| panic!("first - interval errored; err={:?}", e))
-        });
+    // Note that we are here first creating a block where we clone the
+    // Arc of the shared state and then pass that into the async
+    // block. If we didn't do that, the shared_state would be borrowed
+    // inside the async block and this block can outlive the
+    // shared_state *variable* (not the underlying state).
+    let handle1 = tokio::spawn({
+        let state = shared_state.clone();
+        async move {
+            let mut ticker = interval(Duration::from_millis(5000));
+            while let Some(instant) = ticker.next().await {
+                let mut locked_state = state.lock().unwrap();
+                locked_state.dec();
+                println!("first - instant={:?}, state={:?}", instant, locked_state);
+            }
+        }
+    });
 
-        tokio::spawn({
-            let state = shared_state.clone();
-            Interval::new(Instant::now(), Duration::from_millis(500))
-                .for_each(move |instant| {
-                    let mut locked_state = state.lock().unwrap();
-                    locked_state.inc();
-                    println!("second - instant={:?}, state={:?}", instant, locked_state);
-                    Ok(())
-                })
-                .map_err(|e| panic!("second - interval errored; err={:?}", e))
-        });
+    let handle2 = tokio::spawn({
+        let state = shared_state.clone();
+        async move {
+            let mut ticker = interval(Duration::from_millis(500));
+            while let Some(instant) = ticker.next().await {
+                let mut locked_state = state.lock().unwrap();
+                locked_state.inc();
+                println!("second - instant={:?}, state={:?}", instant, locked_state);
+            }
+        }
+    });
 
-        Ok(())
-    }));
+    println!("{:?}", handle1.await);
+    println!("{:?}", handle2.await);
 }

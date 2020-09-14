@@ -1,4 +1,4 @@
-// Copyright 2020 Mats Kindahl
+// Copyright 2019 Mats Kindahl
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you
 // may not use this file except in compliance with the License.  You
@@ -12,19 +12,20 @@
 // implied.  See the License for the specific language governing
 // permissions and limitations under the License.
 
-use std::env;
-use std::error::Error;
-use std::net::SocketAddr;
-use tokio::net::UdpSocket;
+// Example to demonstrate how to generate an infinite stream of
+// fibonacci numbers. Not that this stream will end with an overflow.
+
+extern crate tokio_examples;
+
+use futures::StreamExt;
+use tokio_examples::fibonacci;
 
 #[tokio::main]
-pub async fn main() -> Result<(), Box<dyn Error>> {
-    let message = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "hello world".to_string());
-    let addr: SocketAddr = "127.0.0.1:6142".parse()?;
-    let mut socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let result = socket.send_to(message.as_bytes(), &addr).await?;
-    println!("wrote to stream: result={:?}", result);
+pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let numbers = fibonacci();
+    tokio::pin!(numbers);
+    while let Some(number) = numbers.next().await {
+        println!("number: {}", number);
+    }
     Ok(())
 }
